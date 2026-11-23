@@ -58,6 +58,7 @@ public class Checks implements Listener {
         double fallPeakY = Double.NaN;
         int noFallBuffer, jesusBuffer, elytraBuffer, scaffoldBuffer, totemBuffer, auraAngleBuffer;
         long lastTotemAction, lastFallDamage;
+        long jesusGraceUntil, maceNoFallUntil;
     }
 
     private int tickCount = 0;
@@ -186,7 +187,10 @@ public class Checks implements Listener {
             double h = Math.hypot(dx, dz);
 
             // Jesus: repeated horizontal movement while standing on liquid without swimming.
-            if (on("jesus") && !p.isInsideVehicle() && !p.isSwimming() && !p.isGliding()
+            // Jesus: do not treat sneaking, swimming, or recently placed water as a cheat.
+            // Water-bucket clutches and standing on a freshly placed source block are legitimate.
+            if (on("jesus") && now >= d.jesusGraceUntil && !p.isInsideVehicle()
+                    && !p.isSwimming() && !p.isInWater() && !p.isSneaking() && !p.isGliding()
                     && !p.hasPotionEffect(PotionEffectType.LEVITATION)) {
                 Material feet = cur.getBlock().getType();
                 Material below = cur.clone().subtract(0, 0.08, 0).getBlock().getType();
@@ -195,13 +199,16 @@ public class Checks implements Listener {
                 if (liquidSurface && p.isOnGround() && h > 0.08) d.jesusBuffer++;
                 else d.jesusBuffer = Math.max(0, d.jesusBuffer - 1);
                 if (d.jesusBuffer >= num("checks.jesus.ticks", 8)) {
-                    plugin.flag(p, Category.MOVEMENT, "Jesus", "moving across liquid surface without swimming");
+                    plugin.flag(p, Category.MOVEMENT, "Jesus", "moving across liquid surface without swimming or sneaking");
                     d.jesusBuffer = 2;
                 }
-            } else d.jesusBuffer = 0;
+            } else {
+                d.jesusBuffer = 0;
+            }
 
             // NoFall: remember the highest point of a descent and verify the landing state.
-            if (on("nofall") && !p.isGliding() && !p.isSwimming() && !p.isInWater() && !p.isInsideVehicle()) {
+            // Mace smash attacks intentionally cancel the attacker's fall damage in vanilla.
+            if (on("nofall") && now >= d.maceNoFallUntil && !p.isGliding() && !p.isSwimming() && !p.isInWater() && !p.isInsideVehicle()) {
                 if (!p.isOnGround() && dy < -0.03) {
                     if (Double.isNaN(d.fallPeakY)) d.fallPeakY = prev.getY();
                     else d.fallPeakY = Math.max(d.fallPeakY, prev.getY());
@@ -400,11 +407,20 @@ public class Checks implements Listener {
     @EventHandler(ignoreCancelled = true)
     public void onHit(EntityDamageByEntityEvent e) {
         if (!(e.getDamager() instanceof Player p)) return;
-        if (e.getCause() != EntityDamageEvent.DamageCause.ENTITY_ATTACK) return;
         if (exempt(p)) return;
-        Entity t = e.getEntity();
         Data d = data(p);
         long now = System.currentTimeMillis();
+
+        // A falling player landing a mace smash legitimately receives no normal fall damage.
+        // Suppress NoFall briefly after a mace hit made during a real descent.
+        if (p.getInventory().getItemInMainHand().getType() == Material.MACE && p.getFallDistance() > 1.0f) {
+            d.maceNoFallUntil = Math.max(d.maceNoFallUntil, now + 2500);
+            d.fallPeakY = Double.NaN;
+            d.noFallBuffer = 0;
+        }
+
+        if (e.getCause() != EntityDamageEvent.DamageCause.ENTITY_ATTACK) return;
+        Entity t = e.getEntity();
 
         // KillAura aim-cone sanity: repeated successful attacks on entities well behind
         // the server-observed view direction are highly anomalous. A generous cone and
@@ -497,6 +513,22 @@ public class Checks implements Listener {
         return r == null;
     }
 
+    /**
+     * Returns true when the player has a direct ray to the ore block.
+     * Visible cave ores must not contribute to the Xray score.
+     */
+    private boolean isBlockVisible(Player p, Block target) {
+        Location eye = p.getEyeLocation();
+        Location center = target.getLocation().add(0.5, 0.5, 0.5);
+        Vector direction = center.toVector().subtract(eye.toVector());
+        double distance = direction.length();
+        if (distance < 0.1) return true;
+        RayTraceResult hit = target.getWorld().rayTraceBlocks(
+                eye, direction.normalize(), distance + 0.15, FluidCollisionMode.NEVER, true);
+        // A miss is treated as visible to avoid false positives from ray-trace edge cases.
+        return hit == null || target.equals(hit.getHitBlock());
+    }
+
     // ---------- world ----------
     @EventHandler(ignoreCancelled = true)
     public void onBreak(BlockBreakEvent e) {
@@ -522,7 +554,8 @@ public class Checks implements Listener {
             boolean deep = e.getBlock().getWorld().getEnvironment() == World.Environment.NETHER || e.getBlock().getY() < 20;
             if (deep && (rare || filler)) {
                 int window = (int) num("checks.xray.window", 150);
-                d.xray.addLast(rare);
+                // Only hidden diamonds/debris count. Ores exposed in a cave are ordinary mining.
+                d.xray.addLast(rare && !isBlockVisible(p, e.getBlock()));
                 while (d.xray.size() > window) d.xray.pollFirst();
                 if (d.xray.size() >= window) {
                     int count = 0;
@@ -544,10 +577,24 @@ public class Checks implements Listener {
     }
 
     @EventHandler(ignoreCancelled = true)
+    public void onWaterBucketEmpty(PlayerBucketEmptyEvent e) {
+        if (e.getBucket() != Material.WATER_BUCKET) return;
+        Player p = e.getPlayer();
+        Data d = data(p);
+        d.jesusGraceUntil = Math.max(d.jesusGraceUntil, System.currentTimeMillis() + 5000);
+        d.jesusBuffer = 0;
+    }
+
+    @EventHandler(ignoreCancelled = true)
     public void onPlace(BlockPlaceEvent e) {
         Player p = e.getPlayer();
         if (exempt(p)) return;
         Data d = data(p);
+        // A water bucket placement/clutch is legitimate and can briefly put the player on a liquid surface.
+        if (e.getBlockPlaced().getType() == Material.WATER) {
+            d.jesusGraceUntil = Math.max(d.jesusGraceUntil, System.currentTimeMillis() + 5000);
+            d.jesusBuffer = 0;
+        }
         // Scaffold placement: repeated blocks placed beneath/alongside the player while
         // looking nearly horizontally. This is a pattern detector, not a single-place ban.
         if (on("scaffold")) {
